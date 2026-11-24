@@ -1,0 +1,14 @@
+# Blueprint Render : Web Service Node gratuit.
+# Les salons sont en mémoire : un redémarrage ou un endormissement vide les parties.
+services:
+  - type: web
+    name: soleil
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
