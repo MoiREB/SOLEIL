@@ -24,6 +24,9 @@
     color: "",
     alert: false,
     modal: false,
+    revealClosed: false,
+    notice: false,
+    showSecret: false,
     turnKey: null,
     timer: null,
     sending: false,
@@ -46,7 +49,23 @@
     history.replaceState({}, "", url);
   });
 
+  socket.on("left", () => {
+    state = null;
+    errorMessage = "";
+    lastScreen = "";
+    lastHost = null;
+    ui.showSecret = false;
+    const url = new URL(location.href);
+    url.searchParams.delete("room");
+    history.replaceState({}, "", url.pathname + url.search);
+    render();
+  });
+
   socket.on("state", (next) => {
+    const sameReveal =
+      state && state.phase === "reveal" && next.phase === "reveal" && state.attempts === next.attempts;
+    if (!sameReveal) ui.revealClosed = false;
+    if (state && state.phase === "math" && next.phase !== "math") ui.showSecret = true;
     state = next;
     errorMessage = "";
     ui.sending = false;
@@ -76,7 +95,7 @@
   const nameOf = (id) => (byId(id) ? byId(id).name : "Joueur");
   const myTurn = () => {
     const m = me();
-    return Boolean(state && state.phase === "playing" && m && m.alive && state.ballHolderId === state.viewerId);
+    return Boolean(state && state.phase === "playing" && m && m.alive && !m.found && state.ballHolderId === state.viewerId);
   };
 
   function piece(shape, color) {
@@ -107,18 +126,18 @@
 
   function homeView() {
     return `
-      ${header("")}
+      ${header(`<button type="button" class="secondary back" data-act="notice">Notice</button>`)}
       <p class="muted lead">Déduis la forme et la couleur. Élimine les autres. Reste le dernier en vie.</p>
       ${toast()}
       <div class="panel stack">
         <label>Pseudo
           <input id="name" maxlength="20" placeholder="Ton nom" value="${esc(ui.name)}" />
         </label>
-        <button data-act="create">Créer une partie</button>
         <label>Code du salon
           <input id="code" maxlength="6" placeholder="ABCD" value="${esc(ui.code || params.get("room") || "")}" />
         </label>
-        <button class="secondary" data-act="join">Rejoindre</button>
+        <button class="${String(ui.code || params.get("room") || "").trim() ? "" : "secondary"}" data-act="join">Rejoindre</button>
+        <button data-act="create">Créer une partie</button>
       </div>`;
   }
 
@@ -130,10 +149,30 @@
       )
       .join("");
   }
-  function errorOptions(s) {
-    return [1, 2, 3, 4, 5, 6, 7, 8, 9]
-      .map((n) => `<option value="${n}"${s.maxErrors === n ? " selected" : ""}>${n}</option>`)
-      .join("");
+  function winRadios(s, dis) {
+    const mode = s.winMode === "points" ? "points" : "survival";
+    return `
+      <div class="choice">
+        <span>Façon de gagner</span>
+        <div class="radios">
+          <label class="radio"><input type="radio" name="winMode" value="survival" ${mode === "survival" ? "checked" : ""} ${dis} /> Dernier en vie</label>
+          <label class="radio"><input type="radio" name="winMode" value="points" ${mode === "points" ? "checked" : ""} ${dis} /> Points</label>
+        </div>
+      </div>`;
+  }
+  function errorFields(s, dis) {
+    const unlimited = Boolean(s.unlimitedErrors);
+    return `
+      <div id="errorWrap" class="choice">
+        <span>Essais avant élimination</span>
+        <div class="radios">
+          <label class="radio"><input type="radio" name="errorLimit" value="count" ${unlimited ? "" : "checked"} ${dis} /> Nombre</label>
+          <label class="radio"><input type="radio" name="errorLimit" value="unlimited" ${unlimited ? "checked" : ""} ${dis} /> Illimité</label>
+        </div>
+        <label id="errorCountWrap"${unlimited ? " hidden" : ""}>Nombre d'essais
+          <input type="number" min="1" max="99" id="errorCount" value="${s.maxErrors}" ${dis} />
+        </label>
+      </div>`;
   }
   function pointsMode() {
     return Boolean(state && state.settings && state.settings.winMode === "points");
@@ -142,12 +181,10 @@
     const files = state.avatars || [];
     const mine = me();
     if (!files.length) return "";
-    const taken = new Set(state.players.filter((p) => p.id !== state.viewerId && p.avatar).map((p) => p.avatar));
     const buttons = files
       .map((file) => {
         const picked = mine && mine.avatar === file;
-        const busy = taken.has(file) && !picked;
-        return `<button type="button" class="avbtn${picked ? " picked" : ""}" data-act="avatar" data-file="${esc(file)}" ${busy ? "disabled" : ""} aria-label="${esc(file.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " "))}">${avatar({ avatar: file }, false)}</button>`;
+        return `<button type="button" class="avbtn${picked ? " picked" : ""}" data-act="avatar" data-file="${esc(file)}" aria-label="${esc(file.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " "))}">${avatar({ avatar: file }, false)}</button>`;
       })
       .join("");
     return `
@@ -160,7 +197,7 @@
     const s = state.settings;
     const dis = state.youAreHost ? "" : "disabled";
     return `
-      ${header(`<span class="code">${esc(state.code)}</span>`)}
+      ${header(`<button type="button" class="secondary back" data-act="notice">Notice</button><button type="button" class="secondary back" data-act="leave">Retour</button>`)}
       <div id="toast">${toast()}</div>
       <div class="panel share-panel">
         <div class="share-top">
@@ -173,32 +210,24 @@
         <p class="link" id="shareLink">${esc(location.href)}</p>
         <p class="muted small share-note" id="shareNote"></p>
       </div>
+      <div class="panel">
+        <h2>Joueurs (<span id="lobbyCount">${state.players.length}</span>/<span id="lobbyMax">${s.maxPlayers}</span>)</h2>
+        <div id="lobbyPlayers" class="lrows">${lobbyPlayers()}</div>
+        <div id="avatarPicker">${avatarPicker()}</div>
+      </div>
       <div class="panel stack">
         <h2>Paramètres</h2>
-        <label>Joueurs (2 à 9)
-          <input type="number" min="2" max="9" id="maxPlayers" value="${s.maxPlayers}" ${dis} />
+        <label>Nombre de joueurs
+          <input type="number" min="2" max="99" id="maxPlayers" value="${s.maxPlayers}" ${dis} />
         </label>
-        <label>Façon de gagner
-          <select id="winMode" ${dis}>
-            <option value="survival"${s.winMode === "points" ? "" : " selected"}>Dernier en vie</option>
-            <option value="points"${s.winMode === "points" ? " selected" : ""}>Points</option>
-          </select>
-        </label>
-        <label id="errorWrap"${s.winMode === "points" ? " hidden" : ""}>Essais avant élimination
-          <select id="errorMode" ${dis}>${errorOptions(s)}</select>
-        </label>
-        <p id="pointsHint" class="muted small"${s.winMode === "points" ? "" : " hidden"}>Personne n'est éliminé. On marque des points, et le meilleur score gagne quand toutes les formes sont trouvées.</p>
+        ${winRadios(s, dis)}
+        ${errorFields(s, dis)}
         <label>Délai après chaque tentative (secondes)
           <input type="number" min="1" max="60" id="delaySec" value="${Math.round(s.delayMs / 1000)}" ${dis} />
         </label>
         <label class="check"><input type="checkbox" id="historyVisible" ${s.historyVisible ? "checked" : ""} ${dis} /> Historique visible pendant la partie</label>
         <label class="check"><input type="checkbox" id="fillBots" ${s.fillBots ? "checked" : ""} ${dis} /> Remplir les places vides avec des bots</label>
         ${state.youAreHost ? `<button data-act="start">Lancer la partie</button>` : `<p class="muted">En attente du créateur…</p>`}
-      </div>
-      <div class="panel">
-        <h2>Joueurs (<span id="lobbyCount">${state.players.length}</span>/<span id="lobbyMax">${s.maxPlayers}</span>)</h2>
-        <div id="lobbyPlayers" class="lrows">${lobbyPlayers()}</div>
-        <div id="avatarPicker">${avatarPicker()}</div>
       </div>`;
   }
   function patchLobby() {
@@ -217,30 +246,33 @@
     }
     $("historyVisible").checked = s.historyVisible;
     $("fillBots").checked = s.fillBots;
-    const win = $("winMode");
-    if (win && document.activeElement !== win) {
-      win.value = s.winMode === "points" ? "points" : "survival";
-      win.disabled = !state.youAreHost;
+    document.querySelectorAll('input[name="winMode"]').forEach((el) => {
+      if (document.activeElement !== el) el.checked = el.value === (s.winMode === "points" ? "points" : "survival");
+      el.disabled = !state.youAreHost;
+    });
+    document.querySelectorAll('input[name="errorLimit"]').forEach((el) => {
+      const value = s.unlimitedErrors ? "unlimited" : "count";
+      if (document.activeElement !== el) el.checked = el.value === value;
+      el.disabled = !state.youAreHost;
+    });
+    const count = $("errorCount");
+    if (count && document.activeElement !== count) {
+      count.value = s.maxErrors;
+      count.disabled = !state.youAreHost;
     }
-    const mode = $("errorMode");
-    if (mode && document.activeElement !== mode) {
-      mode.value = String(s.maxErrors);
-      mode.disabled = !state.youAreHost;
-    }
-    const points = s.winMode === "points";
-    const errorWrap = $("errorWrap");
-    const pointsHint = $("pointsHint");
-    if (errorWrap) errorWrap.hidden = points;
-    if (pointsHint) pointsHint.hidden = !points;
+    const errorCountWrap = $("errorCountWrap");
+    if (errorCountWrap) errorCountWrap.hidden = s.unlimitedErrors;
     const picker = $("avatarPicker");
     if (picker) picker.innerHTML = avatarPicker();
   }
   function readSettings() {
-    const winMode = $("winMode").value === "points" ? "points" : "survival";
+    const win = document.querySelector('input[name="winMode"]:checked');
+    const limit = document.querySelector('input[name="errorLimit"]:checked');
+    const winMode = win && win.value === "points" ? "points" : "survival";
     return {
       maxPlayers: Number($("maxPlayers").value),
-      maxErrors: Number($("errorMode").value) || state.settings.maxErrors,
-      unlimitedErrors: false,
+      maxErrors: Number($("errorCount").value) || state.settings.maxErrors,
+      unlimitedErrors: Boolean(limit && limit.value === "unlimited"),
       winMode,
       delayMs: Number($("delaySec").value) * 1000,
       historyVisible: $("historyVisible").checked,
@@ -269,7 +301,7 @@
     return `
       ${header(`<span class="code">${esc(state.code)}</span>`)}
       <div class="panel stack center">
-        <p class="muted">Une seule question pour savoir qui reçoit la balle.<br />Le premier qui trouve commence. Sinon, la réponse la plus proche.</p>
+        <p class="muted">Une seule question pour savoir qui commence.<br />Le premier qui trouve joue en premier. Sinon, c'est la réponse la plus proche.</p>
         <h2 class="question">${esc(state.math ? state.math.question : "")} = ?</h2>
         <input id="math" inputmode="numeric" autocomplete="off" placeholder="Ta réponse" value="${esc(ui.math)}" />
         <button data-act="mathSend">Valider</button>
@@ -287,27 +319,33 @@
     const text = (Number.isInteger(v) ? String(v) : v.toFixed(1)).replace(".", ",");
     return `${text} pt${v >= 2 ? "s" : ""}`;
   }
-  function essaisText(p) {
-    if (pointsMode()) return formatPts(p.points);
+  function triesLabel(p) {
+    if (state.settings.unlimitedErrors) return `Essais ${p.errors}`;
     return `Essais ${p.errors}/${state.settings.maxErrors}`;
+  }
+  function essaisText(p) {
+    if (!pointsMode()) return triesLabel(p);
+    if (state.settings.unlimitedErrors) return formatPts(p.points);
+    return `${formatPts(p.points)} · ${triesLabel(p)}`;
   }
   function infoLine(p) {
     if (p.shape && p.color) return `<span class="lbl">Forme :</span>${piece(p.shape, p.color)}`;
-    let v = "";
-    if (p.clueShape && p.clueColor) v = piece(p.clueShape, p.clueColor);
-    else if (p.clueShape) v = piece(p.clueShape, "gray");
-    else if (p.clueColor) v = SHAPES.map((s) => piece(s, p.clueColor)).join("");
-    return `<span class="lbl">Indice :</span>${v || '<span class="none">—</span>'}`;
+    const bits = [];
+    if (p.clueShape) bits.push(piece(p.clueShape, "gray"));
+    if (p.clueColor) bits.push(SHAPES.map((s) => piece(s, p.clueColor)).join(""));
+    if (!bits.length) return "";
+    return `<span class="lbl">Indice :</span>${bits.join("")}`;
   }
   function pcard(p) {
-    const turn = state.ballHolderId === p.id && p.alive && state.phase !== "ended";
+    const turn = state.ballHolderId === p.id && p.alive && !p.found && state.phase !== "ended";
     const cls = !p.alive ? "dead" : turn ? "turn" : "idle";
+    const info = infoLine(p);
     return `
       <div class="pcard ${cls}">
         <div class="pc-id">${avatar(p, false)}<span class="nm">${esc(p.name)}${p.id === state.viewerId ? " (toi)" : ""}</span></div>
         <div class="pc-info">
           <div class="scoreline">${pointsMode() ? `<span class="pts">${formatPts(p.points)}</span>` : `<span class="essais">${essaisText(p)}</span>`}</div>
-          <div class="infoline">${infoLine(p)}</div>
+          ${info ? `<div class="infoline">${info}</div>` : ""}
         </div>
       </div>`;
   }
@@ -319,7 +357,13 @@
     else verdict = `<span class="v part">Partielle ${gain}</span><span class="hint">${clueVisual(h.clue, h.shape, h.color)}</span>`;
     const elim = [];
     if (h.targetEliminated) elim.push(`${esc(nameOf(h.targetId))} éliminé`);
-    if (h.guesserEliminated) elim.push(`${esc(nameOf(h.guesserId))} éliminé`);
+    if (h.guesserEliminated) {
+      elim.push(
+        pointsMode()
+          ? `${esc(nameOf(h.guesserId))} n'a plus d'essais`
+          : `${esc(nameOf(h.guesserId))} éliminé`
+      );
+    }
     return `
       <li class="hitem">
         <div class="hrow">
@@ -344,11 +388,12 @@
     const right =
       state.phase === "ended"
         ? "Fin de partie"
-        : `Balle : <strong>${esc(nameOf(state.ballHolderId))}</strong>`;
+        : `Au tour de <strong>${esc(nameOf(state.ballHolderId))}</strong>`;
     const spectator =
-      m && !m.alive && state.phase !== "ended"
-        ? `<p class="note">Tu es éliminé. Tu regardes la suite de la partie.</p>`
+      m && state.phase !== "ended" && (!m.alive || (pointsMode() && m.found))
+        ? `<p class="note">${pointsMode() ? "Tu ne joues plus. Tes points restent." : "Tu es éliminé. Tu regardes la suite de la partie."}</p>`
         : "";
+    const finish = finishBtn();
     const hist = historyOn()
       ? `<section class="panel col"><h2>Historique</h2>${historyList()}</section>`
       : "";
@@ -356,6 +401,7 @@
       ${header(right)}
       ${toast()}
       ${spectator}
+      ${finish}
       <div class="board${historyOn() ? "" : " solo"}">
         <section class="panel col"><h2>Joueurs</h2><div class="plist">${state.players.map(pcard).join("")}</div></section>
         ${hist}
@@ -365,15 +411,20 @@
   function alertHtml() {
     return `<div class="alert"><b>À VOUS DE JOUER</b></div>`;
   }
+  function guessTargets() {
+    return state.players.filter((p) => p.alive && !p.found && p.id !== state.viewerId);
+  }
   function modalHtml() {
-    const targets = state.players
-      .filter((p) => p.alive && !p.found && p.id !== state.viewerId)
-      .map(
-        (p) => `
+    const targets = guessTargets();
+    if (targets.length === 1) ui.targetId = targets[0].id;
+    const targetButtons = targets
+      .map((p) => {
+        const info = infoLine(p);
+        return `
         <button class="trow ${ui.targetId === p.id ? "picked" : ""}" data-act="target" data-id="${esc(p.id)}">
-          ${avatar(p, true)}<span class="nm">${esc(p.name)}</span><span class="tclue">${infoLine(p)}</span><span class="ess">${essaisText(p)}</span>
-        </button>`
-      )
+          ${avatar(p, true)}<span class="nm">${esc(p.name)}</span>${info ? `<span class="tclue">${info}</span>` : ""}<span class="ess">${essaisText(p)}</span>
+        </button>`;
+      })
       .join("");
     const shapes = SHAPES.map(
       (s) =>
@@ -381,8 +432,11 @@
     ).join("");
     const colors = COLORS.map(
       (c) =>
-        `<button type="button" class="cbtn ${c}${ui.color === c ? " picked" : ""}" data-act="color" data-color="${c}"><span class="swatch"></span><span>${COLOR_LABEL[c]}</span></button>`
+        `<button type="button" class="cbtn ${c}${ui.color === c ? " picked" : ""}" data-act="color" data-color="${c}"><span>${COLOR_LABEL[c]}</span></button>`
     ).join("");
+    const needTarget = !ui.targetId;
+    const needShape = Boolean(ui.targetId) && !ui.shape;
+    const needColor = Boolean(ui.targetId && ui.shape) && !ui.color;
     const ready = ui.targetId && ui.shape && ui.color && !ui.sending;
     const preview =
       ui.shape && ui.color
@@ -397,13 +451,13 @@
           <h2 class="mtitle">Ta déduction</h2>
           ${toast()}
           <div class="mgrid">
-            <div class="mleft"><h3>Cible</h3><div class="tlist">${targets}</div></div>
+            <div class="mleft${needTarget ? " need" : ""}"><h3>Cible</h3><div class="tlist">${targetButtons}</div></div>
             <div class="mright">
-              <div class="pick-block">
+              <div class="pick-block${needShape ? " need" : ""}">
                 <h3>Forme</h3>
                 <div class="choices">${shapes}</div>
               </div>
-              <div class="pick-block">
+              <div class="pick-block${needColor ? " need" : ""}">
                 <h3>Couleur</h3>
                 <div class="choices">${colors}</div>
               </div>
@@ -448,6 +502,7 @@
     const notes = [];
     if (r.targetEliminated) notes.push(`${esc(nameOf(r.targetId))} est éliminé.`);
     if (r.guesserEliminated) notes.push(`${esc(nameOf(r.guesserId))} a fait sa dernière erreur et est éliminé.`);
+    const visual = clueVisual(r.clue, r.shape, r.color);
     const total = state.settings.delayMs;
     const ms = remainingMs();
     const elapsed = Math.max(0, total - ms);
@@ -457,12 +512,14 @@
         <div class="panel result">
           <div class="cd"><span data-cd>${Math.ceil(ms / 1000)}</span></div>
           <div class="bar"><i style="animation-duration:${total}ms;animation-delay:-${elapsed}ms"></i></div>
-          <div class="duel">${who(r.guesserId)}<span class="arrow big">${ARROW}</span>${who(r.targetId)}<span class="hguess">${piece(r.shape, r.color)}</span></div>
+          <div class="duel">${who(r.guesserId)}<span class="guess-arrow"><span class="hguess">${piece(r.shape, r.color)}</span><span class="arrow big">${ARROW}</span></span>${who(r.targetId)}</div>
           <div class="vbig ${cls}">${title}</div>
           <p class="muted">${sub}</p>
-          <div class="clue-box">${clueVisual(r.clue, r.shape, r.color)}</div>
+          ${visual ? `<div class="clue-box">${visual}</div>` : ""}
           ${notes.length ? `<p class="notes">${notes.join(" ")}</p>` : ""}
           <p class="muted small">Le jeu reprend à la fin du délai.</p>
+          ${finishBtn()}
+          <button type="button" data-act="continue">Continuer</button>
         </div>
       </div>`;
   }
@@ -472,15 +529,16 @@
     return `
       <div class="overlay">
         <div class="panel stack">
-          <h2>La balle change de main</h2>
-          <p class="muted">${esc(nameOf(state.passChooserId))} choisit le prochain détenteur.</p>
+          <h2>Qui joue ensuite ?</h2>
+          <p class="muted">${esc(nameOf(state.passChooserId))} choisit qui joue ensuite.</p>
           ${
             chooser
               ? living
-                  .map((p) => `<button class="trow" data-act="pass" data-id="${esc(p.id)}">${avatar(p, true)}<span class="nm">Donner à ${esc(p.name)}</span></button>`)
+                  .map((p) => `<button class="trow" data-act="pass" data-id="${esc(p.id)}">${avatar(p, true)}<span class="nm">${esc(p.name)}</span></button>`)
                   .join("")
               : `<p class="muted">En attente du choix…</p>`
           }
+          ${finishBtn()}
         </div>
       </div>`;
   }
@@ -498,7 +556,13 @@
               .sort((a, b) => (pointsMode() ? (b.points || 0) - (a.points || 0) : Number(b.alive) - Number(a.alive)))
               .map((p) => {
                 const mark = pointsMode() ? formatPts(p.points) : p.alive ? "En vie" : "Éliminé";
-                return `<li><span class="score-who">${avatar(p, true)}<span>${esc(p.name)}</span></span><b>${mark}</b></li>`;
+                let known = "";
+                if (p.found && p.shape && p.color) known = piece(p.shape, p.color);
+                else if (p.clueColor) known = SHAPES.map((s) => piece(s, p.clueColor)).join("");
+                else if (p.clueShape) known = piece(p.clueShape, "gray");
+                else known = `<span class="miss" title="Rien trouvé">✗</span>`;
+                const secret = p.shape && p.color && !(p.found && p.shape && p.color) ? piece(p.shape, p.color) : "";
+                return `<li><span class="score-who">${avatar(p, true)}<span>${esc(p.name)}</span></span><span class="score-facts">${known}${secret}</span><b>${mark}</b></li>`;
               })
               .join("")}</ol>
             ${
@@ -511,10 +575,103 @@
         </div>
       </div>`;
   }
+  function noticeOverlay() {
+    return `
+      <div class="overlay">
+        <div class="panel stack notice">
+          <h2>Notice</h2>
+          <div class="notice-body">
+            <section>
+              <h3>Le secret</h3>
+              <p>Chaque joueur reçoit une forme cachée : carré, cercle ou triangle.</p>
+              <p>Et une couleur cachée : vert, rouge ou bleu.</p>
+              <p>Personne ne voit la forme des autres.</p>
+            </section>
+            <section>
+              <h3>Les joueurs</h3>
+              <p>On joue à partir de 2 joueurs.</p>
+              <p>Le créateur choisit le nombre de places.</p>
+              <p>Au-delà de 9 joueurs, deux personnes peuvent avoir la même forme.</p>
+              <p>Les places vides peuvent être remplies par des bots.</p>
+            </section>
+            <section>
+              <h3>Qui commence</h3>
+              <p>Un calcul décide qui joue en premier.</p>
+              <p>La première bonne réponse commence.</p>
+              <p>Sinon, c'est la réponse la plus proche.</p>
+              <p>Cette personne propose une forme et une couleur pour quelqu'un d'autre.</p>
+            </section>
+            <section>
+              <h3>La déduction</h3>
+              <p>Forme et couleur justes : la forme est trouvée.</p>
+              <p>Seule la forme est juste : elle s'affiche en gris.</p>
+              <p>Seule la couleur est juste : les trois formes s'affichent dans cette couleur.</p>
+              <p>Rien n'est juste : aucun indice.</p>
+            </section>
+            <section>
+              <h3>Dernier en vie</h3>
+              <p>Si ta forme est trouvée, tu es éliminé.</p>
+              <p>Chaque essai raté compte. Au nombre choisi, tu es éliminé.</p>
+              <p>En illimité, seule une forme trouvée élimine.</p>
+              <p>Le dernier encore en jeu gagne.</p>
+              <p>Si ta forme est trouvée, tu choisis qui joue ensuite. Sinon, c'est la personne visée qui joue.</p>
+            </section>
+            <section>
+              <h3>Points</h3>
+              <p>Une forme exacte vaut 1 point.</p>
+              <p>Un indice vaut 0,5 point.</p>
+              <p>Le nombre d'essais compte aussi. Au maximum choisi, tu ne joues plus.</p>
+              <p>En illimité, tu t'arrêtes seulement si ta forme est trouvée.</p>
+              <p>Tes points restent. Tu peux encore gagner si tu as le meilleur score.</p>
+              <p>La partie se termine quand plus personne ne peut jouer.</p>
+            </section>
+            <section>
+              <h3>Entre deux tours</h3>
+              <p>Après chaque essai, un délai s'affiche.</p>
+              <p>Continuer ferme cette fenêtre. Si tout le monde continue, la partie reprend tout de suite.</p>
+              <p>S'il ne reste que des bots, Finir la partie montre le résultat tout de suite.</p>
+            </section>
+          </div>
+          <button type="button" data-act="closeNotice">Fermer</button>
+        </div>
+      </div>`;
+  }
+  function secretOverlay() {
+    const m = me();
+    if (!m || !m.shape || !m.color) return "";
+    const label = `${SHAPE_LABEL[m.shape] || ""} ${COLOR_LABEL[m.color] || ""}`.trim();
+    return `
+      <div class="overlay">
+        <div class="panel stack center secret">
+          <h2>Votre forme</h2>
+          <p class="muted">Vous avez comme forme</p>
+          <div class="secret-piece">${piece(m.shape, m.color)}</div>
+          <p class="secret-name">${esc(label)}</p>
+          <button type="button" data-act="seenSecret">Continuer</button>
+        </div>
+      </div>`;
+  }
+  function onlyBotsLeft() {
+    if (!state || state.phase === "ended" || state.phase === "lobby" || state.phase === "math") return false;
+    const active = state.players.filter(
+      (p) => p.alive && !p.found && state.players.some((o) => o.alive && !o.found && o.id !== p.id)
+    );
+    if (!active.length || active.some((p) => !p.isBot)) return false;
+    if (state.phase === "pass_ball") {
+      const chooser = byId(state.passChooserId);
+      if (chooser && !chooser.isBot) return false;
+    }
+    return true;
+  }
+  function finishBtn() {
+    if (!onlyBotsLeft()) return "";
+    return `<button type="button" class="finish-now" data-act="finishBots">Finir la partie</button>`;
+  }
   function layerHtml() {
     if (state.phase === "ended") return endOverlay();
+    if (ui.showSecret && secretOverlay()) return secretOverlay();
     if (state.phase === "pass_ball") return passOverlay();
-    if (state.phase === "reveal") return resultOverlay();
+    if (state.phase === "reveal") return ui.revealClosed ? "" : resultOverlay();
     if (ui.alert && myTurn()) return alertHtml();
     if (ui.modal && myTurn()) return modalHtml();
     return "";
@@ -569,8 +726,11 @@
       lastHost = state ? state.youAreHost : null;
     }
     if (screen === "table") {
+      ui.notice = false;
       checkTurn();
       setLayer(layerHtml());
+    } else if (ui.notice) {
+      setLayer(noticeOverlay());
     } else {
       setLayer("");
     }
@@ -592,6 +752,21 @@
       ui.code = $("code").value.trim();
       if (act === "create") socket.emit("createRoom", { name: ui.name || "Joueur" });
       else socket.emit("joinRoom", { name: ui.name || "Joueur", code: ui.code });
+    } else if (act === "seenSecret") {
+      ui.showSecret = false;
+      render();
+    } else if (act === "notice") {
+      ui.notice = true;
+      render();
+    } else if (act === "closeNotice") {
+      ui.notice = false;
+      render();
+    } else if (act === "leave") {
+      socket.emit("leaveRoom");
+    } else if (act === "continue") {
+      ui.revealClosed = true;
+      socket.emit("continueReveal");
+      render();
     } else if (act === "start") {
       socket.emit("startGame", readSettings());
     } else if (act === "mathSend") {
@@ -616,6 +791,8 @@
       socket.emit("chooseAvatar", { file: el.getAttribute("data-file") });
     } else if (act === "share") {
       shareLink();
+    } else if (act === "finishBots") {
+      socket.emit("finishBots");
     } else if (act === "again") {
       location.href = location.pathname;
     }
@@ -687,15 +864,26 @@
     if (event.key === "Enter" && event.target && event.target.id === "math") sendMath();
   });
 
-  const settingIds = ["maxPlayers", "errorMode", "winMode", "delaySec", "historyVisible", "fillBots"];
+  const settingIds = ["maxPlayers", "errorCount", "delaySec", "historyVisible", "fillBots"];
   const onSetting = (event) => {
     if (!state || state.phase !== "lobby" || !state.youAreHost) return;
-    if (event.target && settingIds.includes(event.target.id)) socket.emit("updateSettings", readSettings());
+    const el = event.target;
+    if (!el) return;
+    const named = el.name === "winMode" || el.name === "errorLimit";
+    if (el.name === "errorLimit") {
+      const wrap = $("errorCountWrap");
+      if (wrap) wrap.hidden = el.value === "unlimited";
+    }
+    if (settingIds.includes(el.id) || named) socket.emit("updateSettings", readSettings());
   };
   document.addEventListener("change", onSetting);
   document.addEventListener("input", (event) => {
     if (event.target && event.target.id === "name") ui.name = event.target.value;
-    if (event.target && event.target.id === "code") ui.code = event.target.value;
+    if (event.target && event.target.id === "code") {
+      ui.code = event.target.value;
+      const join = document.querySelector("[data-act='join']");
+      if (join) join.classList.toggle("secondary", !ui.code.trim());
+    }
     if (event.target && event.target.id === "math") ui.math = event.target.value;
     onSetting(event);
   });

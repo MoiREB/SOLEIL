@@ -14,7 +14,7 @@ const PHASES = {
 const DEFAULTS = {
   maxPlayers: 6,
   maxErrors: 2,
-  delayMs: 10000,
+  delayMs: 20000,
   historyVisible: false,
   fillBots: true,
   winMode: "survival",
@@ -44,8 +44,8 @@ function clamp(n, min, max) {
 }
 
 function normalizeSettings(raw = {}) {
-  const maxPlayers = clamp(Number(raw.maxPlayers) || DEFAULTS.maxPlayers, 2, 9);
-  const maxErrors = clamp(Number(raw.maxErrors) || DEFAULTS.maxErrors, 1, 9);
+  const maxPlayers = clamp(Number(raw.maxPlayers) || DEFAULTS.maxPlayers, 2, 99);
+  const maxErrors = clamp(Number(raw.maxErrors) || DEFAULTS.maxErrors, 1, 99);
   const delayMs = clamp(Number(raw.delayMs) || DEFAULTS.delayMs, 1000, 60000);
   const winMode = raw.winMode === "points" ? "points" : "survival";
   return {
@@ -171,8 +171,9 @@ function startGame(game) {
   }
   const combos = shuffle(allCombos());
   game.players.forEach((p, i) => {
-    p.shape = combos[i].shape;
-    p.color = combos[i].color;
+    const combo = combos[i % combos.length];
+    p.shape = combo.shape;
+    p.color = combo.color;
     p.errors = 0;
     p.points = 0;
     p.alive = true;
@@ -250,7 +251,7 @@ function pointsMode(game) {
 }
 
 function canGuess(game, player) {
-  if (!player || !player.alive) return false;
+  if (!player || !player.alive || player.found) return false;
   return game.players.some((p) => p.alive && !p.found && p.id !== player.id);
 }
 
@@ -292,15 +293,15 @@ function guess(game, guesserId, targetId, shape, color) {
     throw new Error("Ce n'est pas le moment de déduire.");
   }
   if (game.ballHolderId !== guesserId) {
-    throw new Error("Tu n'as pas la balle.");
+    throw new Error("Ce n'est pas ton tour.");
   }
   if (!SHAPES.includes(shape) || !COLORS.includes(color)) {
     throw new Error("Combinaison invalide.");
   }
   const guesser = playerById(game, guesserId);
   const target = playerById(game, targetId);
-  if (!guesser || !guesser.alive) throw new Error("Joueur hors jeu.");
-  if (!target || !target.alive) throw new Error("Cible invalide.");
+  if (!guesser || !guesser.alive || guesser.found) throw new Error("Joueur hors jeu.");
+  if (!target || !target.alive || target.found) throw new Error("Cible invalide.");
   if (guesserId === targetId) throw new Error("Tu ne peux pas te cibler.");
 
   const clue = clueFor(shape, color, target);
@@ -320,7 +321,7 @@ function guess(game, guesserId, targetId, shape, color) {
     if (clue === "shape") target.clueShape = shape;
     if (clue === "color") target.clueColor = color;
     guesser.errors += 1;
-    if (!pointsMode(game) && !game.settings.unlimitedErrors && guesser.errors >= game.settings.maxErrors) {
+    if (!game.settings.unlimitedErrors && guesser.errors >= game.settings.maxErrors) {
       guesser.alive = false;
       guesserEliminated = true;
     }
@@ -364,7 +365,17 @@ function afterReveal(game) {
   if (game.phase !== PHASES.REVEAL) return game;
   if (pointsMode(game)) {
     if (maybeEnd(game)) return game;
-    if (handBallToSomeoneWhoCanPlay(game)) return game;
+    const resultNow = game.lastResult;
+    const pointed = resultNow && playerById(game, resultNow.targetId);
+    if (canGuess(game, pointed)) {
+      game.ballHolderId = pointed.id;
+    } else if (!canGuess(game, playerById(game, game.ballHolderId))) {
+      const next = game.players.find((p) => canGuess(game, p));
+      if (next) game.ballHolderId = next.id;
+    }
+    game.phase = PHASES.PLAYING;
+    game.passChooserId = null;
+    return game;
   } else if (livingPlayers(game).length <= 1) {
     maybeEnd(game);
     return game;
@@ -394,7 +405,7 @@ function afterReveal(game) {
 
 function passBall(game, chooserId, toId) {
   if (game.phase !== PHASES.PASS_BALL) {
-    throw new Error("Ce n'est pas le moment de passer la balle.");
+    throw new Error("Ce n'est pas le moment de choisir qui joue.");
   }
   if (game.passChooserId !== chooserId) {
     throw new Error("Tu ne choisis pas le prochain détenteur.");
@@ -441,8 +452,6 @@ function chooseAvatar(game, playerId, file, files) {
   if (!player || player.isBot) {
     throw new Error("Tu ne peux pas changer cet avatar.");
   }
-  const taken = game.players.some((p) => p.id !== playerId && p.avatar === file);
-  if (taken) throw new Error("Cet avatar est déjà pris.");
   player.avatar = file;
   return file;
 }
@@ -674,19 +683,54 @@ function runSelfTests() {
   gp.players[1].color = "red";
   guess(gp, "a", "b", "circle", "blue");
   afterReveal(gp);
-  assert(playerById(gp, "a").alive, "points : une erreur n'élimine pas");
+  assert(playerById(gp, "a").alive, "points : une erreur sous la limite n'arrête pas");
   gp.phase = PHASES.PLAYING;
   gp.ballHolderId = "a";
   guess(gp, "a", "b", "circle", "red");
-  assert(playerById(gp, "b").found, "forme trouvée sans éliminer");
-  assert(playerById(gp, "b").alive, "la cible reste en jeu");
+  assert(playerById(gp, "b").found, "forme trouvée");
+  assert(playerById(gp, "b").alive, "la cible n'est pas éliminée, ses points restent");
+  assert((playerById(gp, "a").points || 0) > (playerById(gp, "b").points || 0), "le trouveur a plus de points");
   afterReveal(gp);
-  assert(gp.phase === PHASES.PLAYING, "il reste une forme à trouver");
-  gp.ballHolderId = "b";
-  guess(gp, "b", "a", "square", "green");
-  afterReveal(gp);
-  assert(gp.phase === PHASES.ENDED, "points : fin quand tout est trouvé");
+  assert(gp.phase === PHASES.ENDED, "plus personne ne peut jouer");
   assert(gp.winnerId === "a", "le meilleur score gagne");
+
+  const gp3 = createGame({ id: "tp3", code: "PT3", settings: { maxPlayers: 3, winMode: "points" } });
+  addPlayer(gp3, { id: "a", name: "A" });
+  addPlayer(gp3, { id: "b", name: "B" });
+  addPlayer(gp3, { id: "c", name: "C" });
+  startGame(gp3);
+  gp3.phase = PHASES.PLAYING;
+  gp3.ballHolderId = "a";
+  gp3.players[0].shape = "square";
+  gp3.players[0].color = "green";
+  gp3.players[1].shape = "circle";
+  gp3.players[1].color = "red";
+  gp3.players[2].shape = "triangle";
+  gp3.players[2].color = "blue";
+  guess(gp3, "a", "b", "circle", "red");
+  afterReveal(gp3);
+  assert(gp3.phase === PHASES.PLAYING, "il reste des formes à chercher");
+  assert(gp3.ballHolderId !== "b", "une forme trouvée ne rejoue pas");
+  assert(playerById(gp3, "b").points === 0, "le joueur trouvé garde ses points");
+
+  const gpErr = createGame({
+    id: "tpe",
+    code: "PTE",
+    settings: { maxPlayers: 2, maxErrors: 1, winMode: "points" },
+  });
+  addPlayer(gpErr, { id: "a", name: "A" });
+  addPlayer(gpErr, { id: "b", name: "B" });
+  startGame(gpErr);
+  gpErr.phase = PHASES.PLAYING;
+  gpErr.ballHolderId = "a";
+  gpErr.players[0].shape = "square";
+  gpErr.players[0].color = "green";
+  gpErr.players[1].shape = "circle";
+  gpErr.players[1].color = "red";
+  gpErr.players[0].points = 2;
+  guess(gpErr, "a", "b", "triangle", "blue");
+  assert(!playerById(gpErr, "a").alive, "points : le nombre d'essais arrête le joueur");
+  assert(playerById(gpErr, "a").points === 2, "ses points restent");
 
   const ga = createGame({ id: "ta", code: "AV", settings: { maxPlayers: 3 } });
   addPlayer(ga, { id: "a", name: "A" });
@@ -704,16 +748,9 @@ function runSelfTests() {
   addPlayer(gb, { id: "a", name: "A" });
   addPlayer(gb, { id: "b", name: "B" });
   chooseAvatar(gb, "a", "soleil.png", ["soleil.png", "lune.jpg"]);
-  chooseAvatar(gb, "b", "lune.jpg", ["soleil.png", "lune.jpg"]);
+  chooseAvatar(gb, "b", "soleil.png", ["soleil.png", "lune.jpg"]);
   assert(playerById(gb, "a").avatar === "soleil.png", "avatar choisi");
-  let taken = false;
-  try {
-    chooseAvatar(gb, "b", "soleil.png", ["soleil.png", "lune.jpg"]);
-  } catch {
-    taken = true;
-  }
-  assert(taken, "un avatar déjà choisi est refusé");
-  assert(playerById(gb, "b").avatar === "lune.jpg", "le choix refusé ne remplace pas l'avatar");
+  assert(playerById(gb, "b").avatar === "soleil.png", "deux joueurs peuvent prendre le même avatar");
 
   const hidden = serializeFor(g2, "a");
   g2.settings.historyVisible = false;

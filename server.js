@@ -74,6 +74,7 @@ function createRoom(hostName, settings) {
     timers: [],
     botTimers: [],
     revealEndsAt: null,
+    continued: new Set(),
   };
   rooms.set(code, room);
   return { room, hostId };
@@ -98,6 +99,15 @@ function attachSocket(room, playerId, socket) {
   socket.data.playerId = playerId;
   socket.data.code = room.code;
   socket.join(room.code);
+}
+
+function dropFromLobby(room, playerId) {
+  removePlayer(room.game, playerId);
+  if (!room.game.players.some((p) => !p.isBot)) {
+    destroyRoom(room.code);
+    return;
+  }
+  broadcast(room);
 }
 
 function emitError(socket, message) {
@@ -153,6 +163,72 @@ function runBot(room, botId) {
   scheduleBots(room);
 }
 
+function canStillPlay(game, player) {
+  if (!player || !player.alive || player.found) return false;
+  return game.players.some((p) => p.alive && !p.found && p.id !== player.id);
+}
+
+function onlyBotsPlaying(game) {
+  if (game.phase === PHASES.ENDED || game.phase === PHASES.LOBBY || game.phase === PHASES.MATH) return false;
+  const active = game.players.filter((p) => canStillPlay(game, p));
+  if (!active.length || active.some((p) => !p.isBot)) return false;
+  if (game.phase === PHASES.PASS_BALL) {
+    const chooser = game.players.find((p) => p.id === game.passChooserId);
+    if (chooser && !chooser.isBot) return false;
+  }
+  return true;
+}
+
+function fastForwardBots(room) {
+  const game = room.game;
+  if (game.phase === PHASES.ENDED) return;
+  if (!onlyBotsPlaying(game)) throw new Error("Des joueurs peuvent encore jouer.");
+  clearTimers(room.timers);
+  clearTimers(room.botTimers);
+  let guard = 0;
+  while (game.phase !== PHASES.ENDED && guard < 500) {
+    guard += 1;
+    if (game.phase === PHASES.REVEAL) {
+      afterReveal(game);
+      continue;
+    }
+    if (game.phase === PHASES.PASS_BALL) {
+      const action = bots.chooseAction(game, game.passChooserId);
+      if (!action || action.type !== "pass") break;
+      passBall(game, game.passChooserId, action.toId);
+      continue;
+    }
+    if (game.phase === PHASES.PLAYING) {
+      const holder = game.players.find((p) => p.id === game.ballHolderId);
+      if (!canStillPlay(game, holder)) {
+        const next = game.players.find((p) => canStillPlay(game, p));
+        if (!next) break;
+        game.ballHolderId = next.id;
+        continue;
+      }
+      const action = bots.chooseAction(game, game.ballHolderId);
+      if (!action || action.type !== "guess") break;
+      try {
+        const result = guess(game, game.ballHolderId, action.targetId, action.shape, action.color);
+        bots.observeResult(game, result);
+      } catch {
+        break;
+      }
+      if (game.phase === PHASES.REVEAL) afterReveal(game);
+      continue;
+    }
+    break;
+  }
+  room.revealEndsAt = null;
+  room.continued = new Set();
+  broadcast(room);
+  if (game.phase === PHASES.ENDED) {
+    schedule(room, () => {
+      if (!humansLeft(room.game)) destroyRoom(room.code);
+    }, 120000);
+  }
+}
+
 function scheduleBots(room) {
   clearTimers(room.botTimers);
   const game = room.game;
@@ -168,21 +244,27 @@ function scheduleBots(room) {
   }
 }
 
+function finishReveal(room) {
+  if (!room || room.game.phase !== PHASES.REVEAL) return;
+  clearTimers(room.timers);
+  room.revealEndsAt = null;
+  room.continued = new Set();
+  afterReveal(room.game);
+  broadcast(room);
+  scheduleBots(room);
+  if (room.game.phase === PHASES.ENDED) {
+    schedule(room, () => {
+      if (!humansLeft(room.game)) destroyRoom(room.code);
+    }, 120000);
+  }
+}
+
 function beginReveal(room) {
   const delay = room.game.settings.delayMs;
+  room.continued = new Set();
   room.revealEndsAt = Date.now() + delay;
   broadcast(room);
-  schedule(room, () => {
-    room.revealEndsAt = null;
-    afterReveal(room.game);
-    broadcast(room);
-    scheduleBots(room);
-    if (room.game.phase === PHASES.ENDED) {
-      schedule(room, () => {
-        if (!humansLeft(room.game)) destroyRoom(room.code);
-      }, 120000);
-    }
-  }, delay);
+  schedule(room, () => finishReveal(room), delay);
 }
 
 function applyGuess(room, guesserId, targetId, shape, color) {
@@ -325,6 +407,41 @@ io.on("connection", (socket) => {
     }
   });
 
+  socket.on("finishBots", () => {
+    const room = getRoom(socket.data.code);
+    if (!room) return;
+    try {
+      fastForwardBots(room);
+    } catch (err) {
+      emitError(socket, err.message);
+    }
+  });
+
+  socket.on("continueReveal", () => {
+    const room = getRoom(socket.data.code);
+    const playerId = socket.data.playerId;
+    if (!room || !playerId || room.game.phase !== PHASES.REVEAL) return;
+    if (!room.continued) room.continued = new Set();
+    room.continued.add(playerId);
+    const humans = room.game.players.filter((p) => !p.isBot);
+    if (humans.length && humans.every((p) => room.continued.has(p.id))) finishReveal(room);
+  });
+
+  socket.on("leaveRoom", () => {
+    const code = socket.data.code;
+    const playerId = socket.data.playerId;
+    const room = getRoom(code);
+    if (room && room.game.phase !== PHASES.LOBBY) return;
+    if (room && playerId && room.sockets.get(playerId) === socket.id) {
+      room.sockets.delete(playerId);
+    }
+    socket.data.playerId = null;
+    socket.data.code = null;
+    if (code) socket.leave(code);
+    socket.emit("left");
+    if (room && playerId) dropFromLobby(room, playerId);
+  });
+
   socket.on("disconnect", () => {
     const room = getRoom(socket.data.code);
     if (!room) return;
@@ -335,12 +452,7 @@ io.on("connection", (socket) => {
     }
     const game = room.game;
     if (game.phase === PHASES.LOBBY) {
-      removePlayer(game, playerId);
-      if (!game.players.some((p) => !p.isBot)) {
-        destroyRoom(game.code);
-        return;
-      }
-      broadcast(room);
+      dropFromLobby(room, playerId);
       return;
     }
     const player = game.players.find((p) => p.id === playerId);
